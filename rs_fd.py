@@ -2,41 +2,47 @@ import numpy as np
 import pandas as pd
 from grr import grr_perturb
 
-def rs_fd_perturb(df, domains, epsilon):
+def rs_fd_perturb(df, domains, epsilon, seed=None):
     n, d = df.shape
-    epsilon_prime = np.log(d * (np.exp(epsilon) - 1) + 1)  # Correct ε′
-    epsilon_prime = epsilon
-    cols = list(domains.keys())
+    if seed is not None:
+        rng_state = np.random.get_state()
+        np.random.seed(seed)
 
+    cols = list(domains.keys())
     privatized = []
+
     for _, row in df.iterrows():
-        j = np.random.randint(d)
-        output = {}
+        j = np.random.randint(d)  # sampled attribute index
+        out = {}
         for i, col in enumerate(cols):
-            domain = domains[col]
+            dom = domains[col]
             if i == j:
-                output[col] = grr_perturb(row[col], domain, epsilon_prime)
+                out[col] = grr_perturb(row[col], dom, epsilon)      # GRR(ε)
             else:
-                output[col] = np.random.choice(domain)
-        privatized.append(output)
+                out[col] = np.random.choice(dom)                    # uniform fake
+        privatized.append(out)
+
+    if seed is not None:
+        np.random.set_state(rng_state)
 
     return pd.DataFrame(privatized, index=df.index)
 
 def rs_fd_estimate(perturbed_df, domains, epsilon):
     n, d = perturbed_df.shape
-    epsilon_prime = np.log(d * (np.exp(epsilon) - 1) + 1)  # Correct ε′
-    epsilon_prime = epsilon
     estimates = {}
-    for col, domain in domains.items():
-        kj = len(domain)
-        p = np.exp(epsilon_prime) / (np.exp(epsilon_prime) + kj - 1)
-        q = 1.0 / (np.exp(epsilon_prime) + kj - 1)
+
+    for col, dom in domains.items():
+        kj = len(dom)
+        exp_eps = np.exp(epsilon)
+        p = exp_eps / (exp_eps + kj - 1)
+        q = 1.0 / (exp_eps + kj - 1)
 
         counts = perturbed_df[col].value_counts().to_dict()
 
         est = {}
-        for v in domain:
+        for v in dom:
             Ni = counts.get(v, 0)
+            # debias with explicit mixture correction
             est[v] = (Ni * d * kj - n * (d - 1 + q * kj)) / (n * kj * (p - q))
         estimates[col] = est
 
