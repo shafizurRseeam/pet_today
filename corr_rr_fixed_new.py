@@ -1,12 +1,4 @@
-
-
-
-
-
-
-
-
-
+# corr_rr_fixed.py
 import numpy as np
 import pandas as pd
 
@@ -14,7 +6,7 @@ import pandas as pd
 # Domain utilities
 # ---------------------------------------------------------------------
 
-def make_domain_map(df):
+def make_domain_map(df: pd.DataFrame):
     """
     Stable, sorted domains for each column; ensures a common domain size,
     which Corr-RR (as written) assumes.
@@ -25,9 +17,11 @@ def make_domain_map(df):
         raise ValueError("Corr-RR assumes a common domain size k across attributes.")
     return domains
 
+
 def _safe_get_freqs(freq_dict, domain):
     """Ensure every category in domain appears in freq_dict; fill zeros if missing."""
     return {v: float(freq_dict.get(v, 0.0)) for v in domain}
+
 
 # ---------------------------------------------------------------------
 # GRR interfaces expected to be provided by your project
@@ -42,57 +36,106 @@ def _grr_estimate_frequencies(reports, domain, epsilon):
     from grr import grr_estimate_frequencies
     return grr_estimate_frequencies(reports, domain, epsilon)
 
+
 # ---------------------------------------------------------------------
-# p_y optimizer (categorical-safe, matches your Proposition)
+# p_y optimizer (GENERAL k, exact quadratic minimizer)
+#   p_y* = - (Σ_v D1_v) / (2 Σ_v D2_v), clipped to [0,1]
+#   where:
+#     alpha_v = (1-Δ)/k + (Δ/2)[ d0(v) + 2 f_a(v) ]
+#     beta_v  = (Δ/2) e(v)
+#     D1_v    = d0(v) e(v)/2 + beta_v (1 - 2 alpha_v) / (n2 Δ^2)
+#     D2_v    = e(v)^2/4      - (beta_v)^2 / (n2 Δ^2)
+#   with:
+#     d0(v) = 1 - f_a(v) - f_b(v),   e(v) = 2 f_b(v) - 1,
+#     Δ = p - q,  p = exp(ε)/(exp(ε)+k-1),  q = 1/(exp(ε)+k-1)
 # ---------------------------------------------------------------------
 
-def optimal_p_y(f_a, f_b, epsilon, n, domain):
+def optimal_p_y(f_a, f_b, epsilon, n2, domain):
     """
-    Closed-form minimizer of average MSE from your Proposition.
-    epsilon is unused in this closed-form; kept for API compatibility.
+    Exact closed-form minimizer of the average Phase-II MSE (both attributes),
+    for general k-ary GRR. Uses the quadratic coefficients from the paper's
+    Proposition (general-k), no binary-only simplifications.
+
+    Args:
+      f_a, f_b: dict value->prob for the two attributes' marginals (Phase-I debiased)
+      epsilon:  float, Phase-II GRR budget
+      n2:       int or float, number of Phase-II users
+      domain:   iterable of categories (size k)
+
+    Returns:
+      p_y in [0,1]
     """
     k = len(domain)
-    n2 = float(n)
-    num = 0.0
-    den = 0.0
+    n2 = float(n2)
+
+    # Guard: if n2 is tiny, avoid divide-by-zero noise
+    if n2 <= 1:
+        return 0.5
+
+    # GRR params
+    exp_eps = np.exp(float(epsilon))
+    p = exp_eps / (exp_eps + k - 1.0)
+    q = 1.0     / (exp_eps + k - 1.0)
+    Delta = p - q
+
+    # If Δ ~ 0, GRR is maximally noisy; p_y has little effect. Return neutral.
+    if abs(Delta) < 1e-12:
+        return 0.5
+
+    sum_D1 = 0.0
+    sum_D2 = 0.0
+    Delta2 = Delta * Delta
+
     for v in domain:
         fa = float(f_a.get(v, 0.0))
         fb = float(f_b.get(v, 0.0))
-        e  = 2.0*fb - 1.0
         d0 = 1.0 - fa - fb
-        a0 = fa - fb
-        num += (d0*e)/(2.0*k) - (a0*e)/(2.0*n2*k)
-        den += (e*e)*((1.0/(4.0*k)) - (1.0/(4.0*n2*k)))
-    if abs(den) < 1e-12:
+        e  = 2.0 * fb - 1.0
+
+        alpha = (1.0 - Delta) / k + (Delta / 2.0) * (d0 + 2.0 * fa)
+        beta  = (Delta / 2.0) * e
+
+        D1 = (d0 * e) / 2.0 + (beta * (1.0 - 2.0 * alpha)) / (n2 * Delta2)
+        D2 = (e * e) / 4.0   - (beta * beta) / (n2 * Delta2)
+
+        sum_D1 += D1
+        sum_D2 += D2
+
+    # If denominator ≈ 0, MSE is flat in p_y (no signal) → return neutral 0.5
+    if abs(sum_D2) < 1e-12:
         return 0.5
-    return float(np.clip(num/den, 0.0, 1.0))
+
+    p_star = - sum_D1 / (2.0 * sum_D2)
+    return float(np.clip(p_star, 0.0, 1.0))
 
 
-# --- helpers (add if not present) ---
-def _safe_get_freqs(freq_dict, domain):
-    return {v: float(freq_dict.get(v, 0.0)) for v in domain}
-
-def build_p_y_table(f_hat_phase1, n2, domain_map):
+def build_p_y_table(f_hat_phase1, n2, domain_map, epsilon):
     """
     Build ordered-pair p_y table using Phase-I debiased marginals.
     Returns: dict[(pivot_col, nonpivot_col)] -> scalar p_y in [0,1]
+
+    NOTE: includes epsilon (needed for general k).
     """
     cols = list(f_hat_phase1.keys())
     table = {}
+    # Verify common k
+    k_set = {len(domain_map[c]) for c in cols}
+    if len(k_set) != 1:
+        raise ValueError("Corr-RR assumes a common domain size across attributes.")
+
+    common_domain = domain_map[cols[0]]
+
     for j in cols:
         for k in cols:
             if j == k:
                 continue
-            domain_j = domain_map[j]
-            domain_k = domain_map[k]
-            if len(domain_j) != len(domain_k):
-                raise ValueError("Corr-RR assumes a common domain size across attributes.")
-            f_a = _safe_get_freqs(f_hat_phase1[j], domain_j)
-            f_b = _safe_get_freqs(f_hat_phase1[k], domain_k)
-            # epsilon not needed for the closed-form; keep API same
-            py  = optimal_p_y(f_a, f_b, epsilon=None, n=n2, domain=domain_j)
+            f_a = _safe_get_freqs(f_hat_phase1[j], common_domain)
+            f_b = _safe_get_freqs(f_hat_phase1[k], common_domain)
+            py  = optimal_p_y(f_a, f_b, epsilon=epsilon, n2=n2, domain=common_domain)
             table[(j, k)] = float(py)
     return table
+
+
 # ---------------------------------------------------------------------
 # Phase I: SPL (private marginals)
 # ---------------------------------------------------------------------
@@ -132,6 +175,7 @@ def corr_rr_phase1_spl(df, epsilon, frac=0.1, domain_map=None, rng=None):
 
     df_B = df.drop(index=df.index[idx_A])
     return f_hat_phase1, df_B, domain_map
+
 
 # ---------------------------------------------------------------------
 # Phase II: Corr-aware synthesis
@@ -175,6 +219,7 @@ def corr_rr_phase2_perturb(df, epsilon, f_hat_phase1, domain_map, p_y_table, rng
 
     return pd.DataFrame(out_rows, index=df.index)[cols]
 
+
 # ---------------------------------------------------------------------
 # Estimation & combine
 # ---------------------------------------------------------------------
@@ -190,16 +235,24 @@ def corr_rr_estimate(perturbed_df, domain_map, epsilon):
         estimates[col] = _grr_estimate_frequencies(reports, domain, epsilon)
     return estimates
 
+
 def combine_phase_estimates(est_A, est_B, n1, n2):
+    """
+    Count-weighted combine of Phase I (n1 users) and Phase II (n2 users).
+    """
+    total = float(n1 + n2)
+    if total <= 0:
+        raise ValueError("n1 + n2 must be positive.")
     combined = {}
     for col in est_A:
         combined[col] = {}
         for v in est_A[col]:
-            combined[col][v] = (n1 * est_A[col][v] + n2 * est_B[col][v]) / (n1 + n2)
+            combined[col][v] = (n1 * est_A[col][v] + n2 * est_B[col][v]) / total
     return combined
 
+
 # ---------------------------------------------------------------------
-# Optional end-to-end helper
+# Optional end-to-end helper (Corr-RR only)
 # ---------------------------------------------------------------------
 
 def run_corr_rr(df, epsilon, frac_phase1=0.1, rng=None):
@@ -210,183 +263,20 @@ def run_corr_rr(df, epsilon, frac_phase1=0.1, rng=None):
       3) Phase II synthesize
       4) Debias Phase II as GRR(eps) per column (biased for non-pivots)
       5) Combine Phase I + II by counts
+    Returns:
+      combined_estimates, p_y_table, (n1, n2)
     """
     f_hat_I, df_B, domain_map = corr_rr_phase1_spl(df, epsilon, frac=frac_phase1, rng=rng)
     n1 = len(df) - len(df_B)
     n2 = len(df_B)
-    p_y_table = build_p_y_table(f_hat_I, n2=n2, domain_map=domain_map)
+
+    # Build ordered-pair p_y using the general-k optimizer
+    p_y_table = build_p_y_table(f_hat_I, n2=n2, domain_map=domain_map, epsilon=epsilon)
+
+    # Phase II synth + debias
     df_II = corr_rr_phase2_perturb(df_B, epsilon, f_hat_I, domain_map, p_y_table, rng=rng)
     est_II = corr_rr_estimate(df_II, domain_map, epsilon)
+
+    # Combine by counts (correct weighting)
     combined = combine_phase_estimates(f_hat_I, est_II, n1=n1, n2=n2)
     return combined, p_y_table, (n1, n2)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import numpy as np
-# import pandas as pd
-# from grr import grr_perturb, grr_estimate_frequencies
-
-# # --- p_y optimizer (as you provided) ---
-# def optimal_p_y(f_a, f_b, epsilon, n, domain):
-#     d = len(domain)
-#     exp_eps = np.exp(epsilon)
-#     p = exp_eps / (exp_eps + d - 1)
-#     q = 1.0 / (exp_eps + d - 1)
-#     Δ = p - q
-
-#     S1 = d*(d-1)/2
-#     S2 = (d-1)*d*(2*d-1)/6
-
-#     μa  = sum(v * f_a[v] for v in domain)
-#     μb  = sum(v * f_b[v] for v in domain)
-#     νb2 = sum(v**2 * f_b[v] for v in domain)
-
-#     a0 = μa - μb
-#     a1 = 2*μb - S1
-#     b1 = 2*νb2 - S2
-#     Y0 = (Δ/2)*a0 + (S1/2)
-
-#     α1 = 2 * sum((1 - f_a[v] - f_b[v]) * ((2*f_a[v]-1) + (2*f_b[v]-1)) for v in domain)
-#     α2 = sum((2*f_a[v]-1)**2 + (2*f_b[v]-1)**2 for v in domain)
-
-#     num = (b1 - 2*Y0*a1)/(2*n*Δ) + α1/(8*d)
-#     den = a1**2/(2*n) - α2/(4*d)
-
-#     p_star = num/den if den != 0 else 1.0
-#     return float(np.clip(p_star, 0.0, 1.0))
-
-
-# # --- Phase I SPL (random sub-sample; unbiased marginals) ---
-# def corr_rr_phase1_spl(df, epsilon, frac=0.1):
-#     n = len(df)
-#     m = max(1, int(round(frac * n)))
-#     idx_A = np.random.choice(n, size=m, replace=False)
-#     df_A = df.iloc[idx_A]
-#     eps_split = epsilon / df.shape[1]
-
-#     reports = []
-#     for _, row in df_A.iterrows():
-#         reports.append([
-#             grr_perturb(row[col], df[col].unique(), eps_split)
-#             for col in df.columns
-#         ])
-#     reports = np.array(reports, dtype=object)
-
-#     est = {}
-#     for i, col in enumerate(df.columns):
-#         domain = df[col].unique()
-#         est[col] = grr_estimate_frequencies(reports[:, i], domain, eps_split)
-
-#     # return the *remaining* users for Phase II
-#     df_B = df.drop(index=df.index[idx_A])
-#     return est, df_B
-
-
-# # --- Phase II perturbation (copy from pivot’s *privatized* value) ---
-# def corr_rr_phase2_perturb(df, epsilon, f_hat_phase1, domain_map, p_y_table):
-#     cols = list(df.columns)
-#     d = len(cols)
-#     out_rows = []
-
-#     for _, row in df.iterrows():
-#         j = np.random.randint(d)
-#         pivot_col = cols[j]
-#         pivot_domain = domain_map[pivot_col]
-
-#         # PRIVATIZE the pivot once
-#         y_pivot = grr_perturb(row[pivot_col], pivot_domain, epsilon)
-#         rec = {pivot_col: y_pivot}
-
-#         # Synthesize non-pivots conditional on y_pivot
-#         for i, col in enumerate(cols):
-#             if i == j:
-#                 continue
-#             domain = domain_map[col]
-#             py = p_y_table.get((pivot_col, col), 0.5)
-#             if np.random.rand() < py:
-#                 rec[col] = y_pivot
-#             else:
-#                 others = [v for v in domain if v != y_pivot]
-#                 rec[col] = np.random.choice(others) if others else y_pivot
-
-#         out_rows.append(rec)
-
-#     # preserve column order
-#     return pd.DataFrame(out_rows, index=df.index)[cols]
-
-
-# # --- Estimation (column-wise GRR debiasing at ε) ---
-# # Note: this treats every column as if passed through GRR(ε).
-# # That is biased for synthesized non-pivots, which you already acknowledge.
-# def corr_rr_estimate(perturbed_df, domains, epsilon):
-#     estimates = {}
-#     for col, domain in domains.items():
-#         reports = perturbed_df[col].tolist()
-#         estimates[col] = grr_estimate_frequencies(reports, domain, epsilon)
-#     return estimates
-
-
-# # --- Combine Phase I (unbiased SPL) + Phase II (biased Corr-RR) by counts ---
-# def combine_phase_estimates(est_A, est_B, m, n_minus_m):
-#     combined = {}
-#     for col in est_A:
-#         combined[col] = {}
-#         for v in est_A[col]:
-#             combined[col][v] = (m * est_A[col][v] + n_minus_m * est_B[col][v]) / (m + n_minus_m)
-#     return combined
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

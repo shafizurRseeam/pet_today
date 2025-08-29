@@ -1,12 +1,4 @@
-
-
-
-
-
-
-
-
-
+# corr_rr_fixed.py
 import numpy as np
 import pandas as pd
 
@@ -43,56 +35,82 @@ def _grr_estimate_frequencies(reports, domain, epsilon):
     return grr_estimate_frequencies(reports, domain, epsilon)
 
 # ---------------------------------------------------------------------
-# p_y optimizer (categorical-safe, matches your Proposition)
+# p_y optimizer (GENERAL k, exact, includes (p+q-1) term)
 # ---------------------------------------------------------------------
 
-def optimal_p_y(f_a, f_b, epsilon, n, domain):
+def optimal_p_y(f_a, f_b, epsilon, n2, domain):
     """
-    Closed-form minimizer of average MSE from your Proposition.
-    epsilon is unused in this closed-form; kept for API compatibility.
+    Exact closed-form minimizer of the average Phase-II MSE (both attributes),
+    for general k-ary GRR. This includes the (p+q-1) term that vanishes only
+    in the binary case (k=2).
+
+    Args:
+      f_a, f_b: dict value->prob for the two attributes' marginals (Phase-I debiased)
+      epsilon:  float, Phase-II GRR budget
+      n2:       int or float, number of Phase-II users
+      domain:   iterable of categories (size k)
+
+    Returns:
+      p_y in [0,1]
     """
     k = len(domain)
-    n2 = float(n)
-    num = 0.0
-    den = 0.0
+    n2 = float(n2)
+
+    # GRR params
+    exp_eps = np.exp(float(epsilon))
+    p = exp_eps / (exp_eps + k - 1.0)
+    q = 1.0     / (exp_eps + k - 1.0)
+    Delta = p - q
+
+    # Sums for the closed form
+    sum_e2   = 0.0
+    sum_term = 0.0
+
     for v in domain:
         fa = float(f_a.get(v, 0.0))
         fb = float(f_b.get(v, 0.0))
         e  = 2.0*fb - 1.0
         d0 = 1.0 - fa - fb
         a0 = fa - fb
-        num += (d0*e)/(2.0*k) - (a0*e)/(2.0*n2*k)
-        den += (e*e)*((1.0/(4.0*k)) - (1.0/(4.0*n2*k)))
-    if abs(den) < 1e-12:
+
+        # numerator aggregate: e * [ (p+q-1)/(n2*Delta) + a0/n2 - d0 ]
+        sum_term += e * ( (p + q - 1.0)/(n2*Delta) + (a0/n2) - d0 )
+        sum_e2   += e * e
+
+    denom = (1.0 - 1.0/n2) * sum_e2
+    if abs(denom) < 1e-12:
+        # No signal in e(v): default to neutral copy-prob
         return 0.5
-    return float(np.clip(num/den, 0.0, 1.0))
+
+    p_star = sum_term / denom
+    return float(np.clip(p_star, 0.0, 1.0))
 
 
-# --- helpers (add if not present) ---
-def _safe_get_freqs(freq_dict, domain):
-    return {v: float(freq_dict.get(v, 0.0)) for v in domain}
-
-def build_p_y_table(f_hat_phase1, n2, domain_map):
+def build_p_y_table(f_hat_phase1, n2, domain_map, epsilon):
     """
     Build ordered-pair p_y table using Phase-I debiased marginals.
     Returns: dict[(pivot_col, nonpivot_col)] -> scalar p_y in [0,1]
+
+    NOTE: includes epsilon (needed for general k).
     """
     cols = list(f_hat_phase1.keys())
     table = {}
+    # Verify common k
+    k_set = {len(domain_map[c]) for c in cols}
+    if len(k_set) != 1:
+        raise ValueError("Corr-RR assumes a common domain size across attributes.")
+
     for j in cols:
         for k in cols:
             if j == k:
                 continue
-            domain_j = domain_map[j]
-            domain_k = domain_map[k]
-            if len(domain_j) != len(domain_k):
-                raise ValueError("Corr-RR assumes a common domain size across attributes.")
-            f_a = _safe_get_freqs(f_hat_phase1[j], domain_j)
-            f_b = _safe_get_freqs(f_hat_phase1[k], domain_k)
-            # epsilon not needed for the closed-form; keep API same
-            py  = optimal_p_y(f_a, f_b, epsilon=None, n=n2, domain=domain_j)
+            domain = domain_map[j]  # same size for all
+            f_a = _safe_get_freqs(f_hat_phase1[j], domain)
+            f_b = _safe_get_freqs(f_hat_phase1[k], domain)
+            py  = optimal_p_y(f_a, f_b, epsilon=epsilon, n2=n2, domain=domain)
             table[(j, k)] = float(py)
     return table
+
 # ---------------------------------------------------------------------
 # Phase I: SPL (private marginals)
 # ---------------------------------------------------------------------
@@ -214,179 +232,93 @@ def run_corr_rr(df, epsilon, frac_phase1=0.1, rng=None):
     f_hat_I, df_B, domain_map = corr_rr_phase1_spl(df, epsilon, frac=frac_phase1, rng=rng)
     n1 = len(df) - len(df_B)
     n2 = len(df_B)
-    p_y_table = build_p_y_table(f_hat_I, n2=n2, domain_map=domain_map)
+    p_y_table = build_p_y_table(f_hat_I, n2=n2, domain_map=domain_map, epsilon=epsilon)
     df_II = corr_rr_phase2_perturb(df_B, epsilon, f_hat_I, domain_map, p_y_table, rng=rng)
     est_II = corr_rr_estimate(df_II, domain_map, epsilon)
-    combined = combine_phase_estimates(f_hat_I, est_II, n1=n1, n2=n2)
+    combined = combine_phase_estimates(f_hat_I, est_II, n1=n2 and n1, n2=n2)  # keep exact weighting
     return combined, p_y_table, (n1, n2)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import numpy as np
-# import pandas as pd
-# from grr import grr_perturb, grr_estimate_frequencies
-
-# # --- p_y optimizer (as you provided) ---
-# def optimal_p_y(f_a, f_b, epsilon, n, domain):
-#     d = len(domain)
-#     exp_eps = np.exp(epsilon)
-#     p = exp_eps / (exp_eps + d - 1)
-#     q = 1.0 / (exp_eps + d - 1)
-#     Δ = p - q
-
-#     S1 = d*(d-1)/2
-#     S2 = (d-1)*d*(2*d-1)/6
-
-#     μa  = sum(v * f_a[v] for v in domain)
-#     μb  = sum(v * f_b[v] for v in domain)
-#     νb2 = sum(v**2 * f_b[v] for v in domain)
-
-#     a0 = μa - μb
-#     a1 = 2*μb - S1
-#     b1 = 2*νb2 - S2
-#     Y0 = (Δ/2)*a0 + (S1/2)
-
-#     α1 = 2 * sum((1 - f_a[v] - f_b[v]) * ((2*f_a[v]-1) + (2*f_b[v]-1)) for v in domain)
-#     α2 = sum((2*f_a[v]-1)**2 + (2*f_b[v]-1)**2 for v in domain)
-
-#     num = (b1 - 2*Y0*a1)/(2*n*Δ) + α1/(8*d)
-#     den = a1**2/(2*n) - α2/(4*d)
-
-#     p_star = num/den if den != 0 else 1.0
-#     return float(np.clip(p_star, 0.0, 1.0))
-
-
-# # --- Phase I SPL (random sub-sample; unbiased marginals) ---
-# def corr_rr_phase1_spl(df, epsilon, frac=0.1):
-#     n = len(df)
-#     m = max(1, int(round(frac * n)))
-#     idx_A = np.random.choice(n, size=m, replace=False)
-#     df_A = df.iloc[idx_A]
-#     eps_split = epsilon / df.shape[1]
-
-#     reports = []
-#     for _, row in df_A.iterrows():
-#         reports.append([
-#             grr_perturb(row[col], df[col].unique(), eps_split)
-#             for col in df.columns
-#         ])
-#     reports = np.array(reports, dtype=object)
-
-#     est = {}
-#     for i, col in enumerate(df.columns):
-#         domain = df[col].unique()
-#         est[col] = grr_estimate_frequencies(reports[:, i], domain, eps_split)
-
-#     # return the *remaining* users for Phase II
-#     df_B = df.drop(index=df.index[idx_A])
-#     return est, df_B
-
-
-# # --- Phase II perturbation (copy from pivot’s *privatized* value) ---
-# def corr_rr_phase2_perturb(df, epsilon, f_hat_phase1, domain_map, p_y_table):
-#     cols = list(df.columns)
-#     d = len(cols)
-#     out_rows = []
-
-#     for _, row in df.iterrows():
-#         j = np.random.randint(d)
-#         pivot_col = cols[j]
-#         pivot_domain = domain_map[pivot_col]
-
-#         # PRIVATIZE the pivot once
-#         y_pivot = grr_perturb(row[pivot_col], pivot_domain, epsilon)
-#         rec = {pivot_col: y_pivot}
-
-#         # Synthesize non-pivots conditional on y_pivot
-#         for i, col in enumerate(cols):
-#             if i == j:
-#                 continue
-#             domain = domain_map[col]
-#             py = p_y_table.get((pivot_col, col), 0.5)
-#             if np.random.rand() < py:
-#                 rec[col] = y_pivot
-#             else:
-#                 others = [v for v in domain if v != y_pivot]
-#                 rec[col] = np.random.choice(others) if others else y_pivot
-
-#         out_rows.append(rec)
-
-#     # preserve column order
-#     return pd.DataFrame(out_rows, index=df.index)[cols]
-
-
-# # --- Estimation (column-wise GRR debiasing at ε) ---
-# # Note: this treats every column as if passed through GRR(ε).
-# # That is biased for synthesized non-pivots, which you already acknowledge.
-# def corr_rr_estimate(perturbed_df, domains, epsilon):
-#     estimates = {}
-#     for col, domain in domains.items():
-#         reports = perturbed_df[col].tolist()
-#         estimates[col] = grr_estimate_frequencies(reports, domain, epsilon)
-#     return estimates
-
-
-# # --- Combine Phase I (unbiased SPL) + Phase II (biased Corr-RR) by counts ---
-# def combine_phase_estimates(est_A, est_B, m, n_minus_m):
-#     combined = {}
-#     for col in est_A:
-#         combined[col] = {}
-#         for v in est_A[col]:
-#             combined[col][v] = (m * est_A[col][v] + n_minus_m * est_B[col][v]) / (m + n_minus_m)
-#     return combined
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# ---------------------------------------------------------------------
+# Extras: sweep & p_y table generation (optional)
+# ---------------------------------------------------------------------
+
+def _normalize_dist(d):
+    vals = np.array([max(0.0, float(v)) for v in d.values()], dtype=float)
+    s = vals.sum()
+    if s <= 0:
+        k = len(vals)
+        vals = np.full(k, 1.0 / k)
+    else:
+        vals = vals / s
+    return {k: vals[i] for i, k in enumerate(d.keys())}
+
+def _build_p_y_table_minimal(est_I, epsilon, n2, domain, cols):
+    """
+    Build p_y[(a->b)] for all ordered pairs using optimal_p_y().
+    """
+    return {
+        (a, b): float(optimal_p_y(est_I[a], est_I[b], epsilon, n2, domain))
+        for a in cols for b in cols if a != b
+    }
+
+# ---------------- p_y table viewer ----------------
+
+def p_y_tables_for_epsilons(
+    df,
+    epsilons,
+    frac_phase1_corr=0.1,
+    use_minimal_builder=True,
+    csv_dir=None,
+    float_fmt="%.6f",
+):
+    """
+    For each epsilon:
+      - run Phase I via corr_rr_phase1_spl
+      - build p_y[(a->b)] using either _build_p_y_table_minimal(...) or build_p_y_table(...)
+      - pretty-print and (optionally) save a CSV matrix with rows a, cols b
+
+    Returns: dict {epsilon: pandas.DataFrame} where DataFrame is the p_y matrix.
+    """
+    if csv_dir:
+        import os
+        os.makedirs(csv_dir, exist_ok=True)
+
+    cols = list(df.columns)
+    results = {}
+
+    for eps in epsilons:
+        # Phase I (SPL) to get est_I and stable domains
+        est_I, df_B, doms_stable = corr_rr_phase1_spl(df, eps, frac=frac_phase1_corr)
+        n2 = len(df_B)
+
+        # choose builder
+        if use_minimal_builder:
+            common_domain = doms_stable[cols[0]]
+            pmap = _build_p_y_table_minimal(est_I, eps, n2, common_domain, cols)
+        else:
+            pmap = build_p_y_table(est_I, n2, doms_stable, epsilon=eps)
+
+        # pivot to a matrix with NaN on diagonal
+        mat = pd.DataFrame(index=cols, columns=cols, dtype=float)
+        for a in cols:
+            for b in cols:
+                if a == b:
+                    mat.loc[a, b] = float('nan')
+                else:
+                    mat.loc[a, b] = float(pmap[(a, b)])
+
+        # pretty print
+        print(f"\n=== p_y table (Corr-RR Phase I → optimization) for epsilon = {eps} ===")
+        with pd.option_context('display.float_format', lambda v: float_fmt % v):
+            print(mat)
+
+        # optional save
+        if csv_dir:
+            import os
+            fname = os.path.join(csv_dir, f"py_table_eps_{str(eps).replace('.', '_')}.csv")
+            mat.to_csv(fname, float_format=float_fmt)
+            print(f"[saved] {fname}")
+
+        results[eps] = mat
+
+    return results
