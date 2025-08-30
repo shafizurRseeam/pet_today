@@ -1,19 +1,13 @@
+# data_utils_new.py
 import numpy as np
 import pandas as pd
 
-def _as_prob_vector(domain, spec):
-    """
-    Convert a prob spec (dict {val:p} or list aligned with domain) to a vector
-    aligned with `domain`, and validate it.
-    """
-    d = len(domain)
-    if spec is None:
-        v = np.ones(d, dtype=float) / d
-    elif isinstance(spec, dict):
-        v = np.array([float(spec.get(v, 0.0)) for v in domain], dtype=float)
+def _as_vec(domain, spec):
+    if isinstance(spec, dict):
+        v = np.array([float(spec.get(d, 0.0)) for d in domain], dtype=float)
     else:
         v = np.array(spec, dtype=float)
-        if len(v) != d:
+        if len(v) != len(domain):
             raise ValueError("Probability list length must match domain size.")
     if (v < 0).any():
         raise ValueError("Probabilities must be non-negative.")
@@ -22,35 +16,23 @@ def _as_prob_vector(domain, spec):
         raise ValueError("Probabilities must sum to a positive value.")
     return v / s
 
-def _choice_from_probs(domain, p, size):
-    idx = np.random.choice(len(domain), size=size, p=p)
-    return np.array(domain, dtype=object)[idx]
-
-def correlated_data_generator(
-    domain,
+def gen_correlated_pairs(
     n,
-    correlations=None,
-    total_attributes=None,
+    domain,
+    rho,
+    odd_marginals,          # dict for X1 only, OR list [p1, p3, p5, ...]
+    q_marginal=None,        # base for even attrs when not copying; None -> uniform
     seed=None,
-    base_marginals=None,
-    default_base=None,
+    start_index=1,
 ):
     """
-    Generate a discrete dataset with optional pairwise 'same-value' correlations
-    and NON-UNIFORM attribute marginals.
+    Generate correlated pairs on a single numeric domain.
+      - For each provided odd marginal p_i:
+          X_{k}   ~ p_i, where k = start_index + 2*i
+          X_{k+1} = X_{k} w.p. rho; else ~ q_marginal (defaults to uniform)
+    If `odd_marginals` is a dict/list for a SINGLE marginal, produces just (X1, X2).
 
-    Args:
-      domain: iterable of categorical values (e.g., [0,1,2]).
-      n: number of rows.
-      correlations: list of tuples [(attr1, attr2, p_same), ...].
-      total_attributes: ensure columns X1..X{total_attributes} exist.
-      seed: RNG seed for reproducibility.
-      base_marginals:
-         - dict mapping attribute -> prob spec (dict {val:p} OR list aligned to domain)
-         - optional key 'default' for fallback.
-      default_base:
-         - global default prob spec if not provided in base_marginals['default'].
-           If both missing, uniform is used.
+    Returns: DataFrame with columns X{start_index}..X{start_index+2*m-1}
     """
     if seed is not None:
         np.random.seed(seed)
@@ -58,74 +40,56 @@ def correlated_data_generator(
     domain = list(domain)
     d = len(domain)
 
-    # Build per-attribute base distributions
-    def get_base(attr):
-        if isinstance(base_marginals, dict) and attr in base_marginals:
-            return _as_prob_vector(domain, base_marginals[attr])
-        if isinstance(base_marginals, dict) and 'default' in base_marginals:
-            return _as_prob_vector(domain, base_marginals['default'])
-        if default_base is not None:
-            return _as_prob_vector(domain, default_base)
-        return np.ones(d) / d  # uniform
-
-    df = pd.DataFrame()
-
-    # Process correlation pairs; reuse existing attr1 if already present
-    if correlations:
-        for attr1, attr2, p_same in correlations:
-            # Ensure X_attr1 exists (sample from its base marginal)
-            if attr1 not in df.columns:
-                p1 = get_base(attr1)
-                df[attr1] = _choice_from_probs(domain, p1, n)
-            X1 = df[attr1].to_numpy()
-
-            # Prepare base for attr2
-            p2_full = get_base(attr2)
-
-            # Decide where to copy vs differ
-            mask_same = np.random.rand(n) < float(p_same)
-            X2 = np.empty(n, dtype=object)
-
-            # Copy positions
-            X2[mask_same] = X1[mask_same]
-
-            # Different positions: sample from p2 restricted to values != X1[i]
-            if (~mask_same).any():
-                idxs = np.where(~mask_same)[0]
-                x1_diff = X1[idxs]
-                # For each row, zero out the prob of X1[i] then renormalize
-                val_to_idx = {v: i for i, v in enumerate(domain)}
-                for j, v1 in enumerate(x1_diff):
-                    p = p2_full.copy()
-                    p[val_to_idx[v1]] = 0.0
-                    s = p.sum()
-                    if s == 0:
-                        # degenerate: if base put all mass on v1, fallback to uniform over others
-                        p[:] = 1.0
-                        p[val_to_idx[v1]] = 0.0
-                        p /= p.sum()
-                    else:
-                        p /= s
-                    X2[idxs[j]] = _choice_from_probs(domain, p, 1)[0]
-
-            df[attr2] = X2
-
-    # Ensure requested attributes exist (with their own marginals)
-    if total_attributes is not None:
-        all_attrs = [f'X{i+1}' for i in range(total_attributes)]
+    # Normalize inputs
+    if isinstance(odd_marginals, (dict, list, tuple)) and not (
+        isinstance(odd_marginals, list) and odd_marginals and isinstance(odd_marginals[0], (dict, list, tuple))
+    ):
+        # Single marginal -> one pair
+        odd_list = [odd_marginals]
     else:
-        all_attrs = list(df.columns)
+        # Already a list of marginals
+        odd_list = list(odd_marginals)
 
-    for attr in all_attrs:
-        if attr not in df.columns:
-            p = get_base(attr)
-            df[attr] = _choice_from_probs(domain, p, n)
+    q = _as_vec(domain, q_marginal if q_marginal is not None else np.ones(d) / d)
+    rho = float(np.clip(rho, 0.0, 1.0))
 
-    # Reorder columns if total_attributes was provided
-    if total_attributes is not None:
-        df = df[[f'X{i+1}' for i in range(total_attributes)]]
+    data = {}
+    for i, p_spec in enumerate(odd_list):
+        odd_idx = start_index + 2 * i
+        even_idx = odd_idx + 1
+        odd_col, even_col = f"X{odd_idx}", f"X{even_idx}"
 
-    return df
+        p = _as_vec(domain, p_spec)
+
+        # X_odd ~ p
+        X_odd = np.array(domain)[np.random.choice(d, size=n, p=p)]
+
+        # X_even: copy-or-q
+        copy_mask = (np.random.rand(n) < rho)
+        X_even = np.empty(n, dtype=object)
+        X_even[copy_mask] = X_odd[copy_mask]
+        non_idx = np.where(~copy_mask)[0]
+        if non_idx.size:
+            X_even[non_idx] = np.array(domain)[np.random.choice(d, size=non_idx.size, p=q)]
+
+        data[odd_col]  = X_odd.astype(int)
+        data[even_col] = X_even.astype(int)
+
+    return pd.DataFrame(data)
+
+# --------- small helpers ----------
+def match_rate(df, a="X1", b="X2"):
+    return float((df[a] == df[b]).mean())
+
+def empirical_corr(df, a="X1", b="X2"):
+    return df[a].astype(float).corr(df[b].astype(float))
+
+def freqs(df, domain):
+    out = {}
+    for col in df.columns:
+        vc = df[col].value_counts(normalize=True, sort=False)
+        out[col] = {v: float(vc.get(v, 0.0)) for v in domain}
+    return out
 
 def get_true_frequencies(df, columns=None):
     columns = columns or list(df.columns)
@@ -134,3 +98,94 @@ def get_true_frequencies(df, columns=None):
         counts = df[col].value_counts(normalize=True).sort_index()
         out[col] = counts.to_dict()
     return out
+
+
+
+
+# # data_utils_new.py
+# import numpy as np
+# import pandas as pd
+
+# # -------------------- core generator --------------------
+# def gen_two_drifting(n, domain, x1_marginal, rho, q_marginal=None, seed=None):
+#     """
+#     Generate two correlated discrete vars X1, X2 on the SAME numeric domain.
+#       - X1 ~ p (your x1_marginal)
+#       - With prob rho:  X2 = X1
+#         Else:           X2 ~ q  (defaults to uniform over domain)
+#     => Marginal(X2) = rho * p + (1 - rho) * q  (X2 drifts toward q as rho↓).
+
+#     Args:
+#       n: number of samples
+#       domain: list like [0,1,2,...] (must be numeric)
+#       x1_marginal: dict or list aligned with domain (p)
+#       rho: desired copy probability in [0,1]
+#       q_marginal: dict or list aligned with domain for q (defaults to uniform)
+#       seed: RNG seed
+
+#     Returns: DataFrame with int columns X1, X2
+#     """
+#     if seed is not None:
+#         np.random.seed(seed)
+
+#     domain = list(domain)
+#     d = len(domain)
+
+#     def as_vec(spec):
+#         if isinstance(spec, dict):
+#             v = np.array([float(spec.get(v, 0.0)) for v in domain], dtype=float)
+#         else:
+#             v = np.array(spec, dtype=float)
+#             if len(v) != d:
+#                 raise ValueError("Probability list length must match domain size.")
+#         if (v < 0).any(): raise ValueError("Probabilities must be non-negative.")
+#         s = v.sum()
+#         if s <= 0: raise ValueError("Probabilities must sum to a positive value.")
+#         return v / s
+
+#     p = as_vec(x1_marginal)
+#     q = as_vec(q_marginal if q_marginal is not None else np.ones(d) / d)
+#     rho = float(np.clip(rho, 0.0, 1.0))
+
+#     # Sample X1 ~ p
+#     X1 = np.array(domain)[np.random.choice(d, size=n, p=p)]
+
+#     # Copy-or-q for X2
+#     copy_mask = (np.random.rand(n) < rho)
+#     X2 = np.empty(n, dtype=object)
+#     X2[copy_mask] = X1[copy_mask]
+#     non_idx = np.where(~copy_mask)[0]
+#     if non_idx.size:
+#         X2[non_idx] = np.array(domain)[np.random.choice(d, size=non_idx.size, p=q)]
+
+#     # Ensure numeric dtype for compatibility elsewhere
+#     return pd.DataFrame({"X1": X1.astype(int), "X2": X2.astype(int)})
+
+# # -------------------- utilities --------------------
+# def match_rate(df):
+#     """Fraction of rows where X1 == X2."""
+#     return float((df["X1"] == df["X2"]).mean())
+
+# def empirical_corr(df):
+#     """Pearson correlation between numeric X1 and X2."""
+#     return df["X1"].astype(float).corr(df["X2"].astype(float))
+
+# def freqs(df, domain):
+#     """Empirical marginals by column in the provided domain order (no sorting)."""
+#     out = {}
+#     for col in df.columns:
+#         vc = df[col].value_counts(normalize=True, sort=False)
+#         out[col] = {v: float(vc.get(v, 0.0)) for v in domain}
+#     return out
+
+# def get_true_frequencies(df, columns=None):
+#     """
+#     Normalized frequency dict per column (sorted by value to keep numeric order stable):
+#       {col: {value: prob, ...}, ...}
+#     """
+#     columns = columns or list(df.columns)
+#     out = {}
+#     for col in columns:
+#         counts = df[col].value_counts(normalize=True).sort_index()
+#         out[col] = counts.to_dict()
+#     return out
