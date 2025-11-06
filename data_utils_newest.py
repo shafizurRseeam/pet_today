@@ -80,6 +80,65 @@ def gen_star_from_x1(
 
     return pd.DataFrame(data)
 
+def gen_progressive(
+    n,
+    domain,
+    d,                  # total number of attributes (>=1)
+    x1_marginal,        # marginal p for X1
+    rho,                # global copy prob for all Xj (j>=2)
+    q_marginal=None,    # base q for non-copy draws; None -> uniform
+    seed=None,
+):
+    """
+    PROGRESSIVE model:
+      - X1 ~ p  (p = x1_marginal)
+      - For j >= 2:
+            Choose a parent π(j) uniformly from {1,...,j-1}
+            Xj = X_{π(j)} w.p. rho
+            Xj = Z_j ~ q   w.p. 1 - rho
+
+    Returns: DataFrame with columns X1..Xd
+    """
+    if d < 1:
+        raise ValueError("d must be at least 1.")
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    domain = list(domain)
+    k = len(domain)
+
+    # Normalize distributions
+    p = _as_vec(domain, x1_marginal)
+    q = _as_vec(domain, q_marginal if q_marginal is not None else np.ones(k) / k)
+    rho = float(np.clip(rho, 0.0, 1.0))
+
+    # --- 1. Sample X1 ~ p ---
+    X = {}
+    X1 = np.array(domain)[np.random.choice(k, size=n, p=p)]
+    X["X1"] = _maybe_int(X1)
+
+    # --- 2. Generate X2..Xd under progressive dependency ---
+    for j in range(2, d + 1):
+        # Parent index uniformly from {1, ..., j-1}
+        parent = np.random.randint(1, j)  # inclusive of 1, exclusive of j
+
+        copy_mask = (np.random.rand(n) < rho)
+        Xj = np.empty(n, dtype=object)
+
+        # Copy from parent
+        parent_col = f"X{parent}"
+        parent_vals = X[parent_col]
+        Xj[copy_mask] = parent_vals[copy_mask]
+
+        # Draw fresh from q
+        non_idx = np.where(~copy_mask)[0]
+        if non_idx.size:
+            Xj[non_idx] = np.array(domain)[np.random.choice(k, size=non_idx.size, p=q)]
+
+        X[f"X{j}"] = _maybe_int(Xj)
+
+    return pd.DataFrame(X)
 
 def gen_correlated_pairs(
     n,
